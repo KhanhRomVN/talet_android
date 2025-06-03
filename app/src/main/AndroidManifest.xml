@@ -27,5 +27,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Thêm khai báo activity demo H264 streaming -->
+        <activity
+            android:name=".H264StreamActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:label="H264StreamActivity"/>
+        <!-- Thêm service foreground cho mediaprojection stream -->
+        <service
+            android:name=".H264StreamService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection"
+        />
     </application>
 </manifest>

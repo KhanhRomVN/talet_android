@@ -16,6 +16,8 @@ import android.widget.ProgressBar;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.kr.talet.UdpScreenSender;
+
 public class MainActivity extends AppCompatActivity {
     private TextView statusText;
     private TextView localIpText;
@@ -25,6 +27,8 @@ public class MainActivity extends AppCompatActivity {
     private final List<DeviceItem> devices = new ArrayList<>();
     private Button scanButton;
     private boolean isScanning = false;
+    // --- Thêm field giữ UdpScreenSender ---
+    private UdpScreenSender udpScreenSender = null;
 
     static {
         System.loadLibrary("talet_engine");
@@ -243,6 +247,11 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         stopDiscovery();
+        // --- Nếu có gửi màn hình, dừng lại khi activity phá huỷ ---
+        if (udpScreenSender != null) {
+            udpScreenSender.stop();
+            udpScreenSender = null;
+        }
         super.onDestroy();
     }
 
@@ -391,10 +400,22 @@ public class MainActivity extends AppCompatActivity {
 
     // Chuyển sang giao diện/màn hình streaming, tuỳ ý tuỳ chỉnh lại sau này
     private void goToStreamingScreen(DeviceItem device) {
-        // TODO: Tùy vào cấu trúc app, chuyển Activity/Fragment, hoặc update UI streaming mode
-        statusText.setText("Đã kết nối tới " + device.getName() + "\n(Giả lập chuyển giao diện streaming)");
-        showToast("🎥 Đã sẵn sàng streaming, hãy bắt đầu!");
-        // Có thể cập nhật UI, ẩn deviceList, hiển thị các control streaming...
+        // Khởi động gửi màn hình qua UDP tới Talet PC sau khi xác thực xong!
+        try {
+            // Luôn ngắt instance cũ nếu có
+            if (udpScreenSender != null) {
+                udpScreenSender.stop();
+                udpScreenSender = null;
+            }
+            // Lấy đúng IP đối tượng (PC đã nhập), gửi qua cổng 27200 mặc định
+            udpScreenSender = new UdpScreenSender(this, device.getIp(), 27200);
+            udpScreenSender.start();
+            showToast("Bắt đầu gửi màn hình lên PC (" + device.getIp() + ":27200) qua UDP!");
+        } catch (Exception ex) {
+            showAlert("Gửi màn hình thất bại", ex.getMessage());
+        }
+        // UI update như cũ
+        statusText.setText("Đã kết nối tới " + device.getName() + "\n(Streaming to PC trên LAN)");
         deviceList.setVisibility(View.GONE);
         progressBar.setVisibility(View.GONE);
     }
