@@ -19,13 +19,8 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 
-/**
- * SỬA: lấy resolution thực tế, giữ instance VirtualDisplay để không bị thu hồi tự động
- *      loop encode không break silent, always check exception/log
- */
 public class H264ScreenStreamer {
-    private static final String MIME_TYPE = "video/avc"; // H.264
-
+    private static final String MIME_TYPE = "video/avc";
     private static final String TAG = "H264ScreenStreamer";
     private MediaProjection mediaProjection;
     private MediaCodec encoder;
@@ -71,7 +66,6 @@ public class H264ScreenStreamer {
         encodeThread = new Thread(this::encodeLoop, "H264EncodeThread");
         encodeThread.start();
 
-        // GIỮ instance VirtualDisplay, không tạo biến cục bộ!
         virtualDisplay = mediaProjection.createVirtualDisplay(
             "ScreenCapture",
             videoWidth, videoHeight, densityDpi,
@@ -83,13 +77,17 @@ public class H264ScreenStreamer {
         android.util.Log.i(TAG, "VirtualDisplay created");
     }
 
+    // Luôn prepend SPS+PPS vào mỗi frame để đảm bảo client PC recover ngay khi resume!
     private void encodeLoop() {
         DatagramSocket udpSocket = null;
+        byte[] spsData = null;
+        byte[] ppsData = null;
         try {
             udpSocket = new DatagramSocket();
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
             android.util.Log.i(TAG, "encodeLoop started (thread=" + Thread.currentThread().getName() + ")");
-            int totalFrames = 0;
+            int totalFrames = 0, frameIdx = 0;
+            boolean sentConfigWarning = false;
             while (streaming) {
                 int outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000);
                 if (outIndex >= 0) {
@@ -97,26 +95,83 @@ public class H264ScreenStreamer {
                     if (encodedData != null && bufferInfo.size > 0) {
                         encodedData.position(bufferInfo.offset);
                         encodedData.limit(bufferInfo.offset + bufferInfo.size);
-                        byte[] buf = new byte[bufferInfo.size];
-                        encodedData.get(buf);
-                        int offset = 0;
+                        byte[] frameData = new byte[bufferInfo.size];
+                        encodedData.get(frameData);
+
+                        boolean hasSps = spsData != null && spsData.length > 0;
+                        boolean hasPps = ppsData != null && ppsData.length > 0;
+                        byte[] finalFrameData;
+                        if (hasSps && hasPps) {
+                            finalFrameData = new byte[spsData.length + ppsData.length + frameData.length];
+                            System.arraycopy(spsData, 0, finalFrameData, 0, spsData.length);
+                            System.arraycopy(ppsData, 0, finalFrameData, spsData.length, ppsData.length);
+                            System.arraycopy(frameData, 0, finalFrameData, spsData.length + ppsData.length, frameData.length);
+                            if (totalFrames % 10 == 0)
+                                android.util.Log.i(TAG, "[LOG-SPSPPS-ALLFRAME] Prepend SPS/PPS EVERY FRAME. frameIdx=" + frameIdx + ", total=" + totalFrames + ", size=" + finalFrameData.length);
+                        } else {
+                            finalFrameData = frameData;
+                        }
+
                         int mtu = 1300;
-                        int sentBytes = 0;
-                        int nChunks = 0;
-                        while (offset < buf.length) {
-                            int len = Math.min(mtu, buf.length - offset);
-                            DatagramPacket packet = new DatagramPacket(buf, offset, len, serverIp, serverPort);
+                        int nChunks = (finalFrameData.length + mtu - 1) / mtu;
+                        int totalsz = finalFrameData.length;
+                        for (int chunk_id = 0; chunk_id < nChunks; chunk_id++) {
+                            int offset = chunk_id * mtu;
+                            int len = Math.min(mtu, finalFrameData.length - offset);
+                            byte[] header = new byte[12];
+                            header[0] = (byte)((frameIdx >> 24) & 0xFF);
+                            header[1] = (byte)((frameIdx >> 16) & 0xFF);
+                            header[2] = (byte)((frameIdx >> 8) & 0xFF);
+                            header[3] = (byte)(frameIdx & 0xFF);
+                            header[4] = (byte)((nChunks >> 8) & 0xFF);
+                            header[5] = (byte)(nChunks & 0xFF);
+                            header[6] = (byte)((chunk_id >> 8) & 0xFF);
+                            header[7] = (byte)(chunk_id & 0xFF);
+                            header[8] = (byte)((totalsz >> 24) & 0xFF);
+                            header[9] = (byte)((totalsz >> 16) & 0xFF);
+                            header[10] = (byte)((totalsz >> 8) & 0xFF);
+                            header[11] = (byte)(totalsz & 0xFF);
+
+                            byte[] packetBytes = new byte[12 + len];
+                            System.arraycopy(header, 0, packetBytes, 0, 12);
+                            System.arraycopy(finalFrameData, offset, packetBytes, 12, len);
+
+                            if (chunk_id == 0) {
+                                android.util.Log.d(TAG, "[SEND] frame=" + frameIdx + " chunk=" + chunk_id + " len=" + len +
+                                        " total_chunks=" + nChunks + " totalsz=" + totalsz +
+                                        " header=" + bytesToHex(header) +
+                                        " payload_head=" + bytesToHex(finalFrameData, Math.min(finalFrameData.length, 32)));
+                            }
+
+                            DatagramPacket packet = new DatagramPacket(packetBytes, packetBytes.length, serverIp, serverPort);
                             udpSocket.send(packet);
-                            sentBytes += len; nChunks++;
-                            offset += len;
                         }
                         totalFrames++;
+                        frameIdx++;
                         if (totalFrames % 20 == 0)
-                            android.util.Log.i(TAG, "[STREAM] Sent video frame=" + totalFrames + ", size=" + buf.length + "B, chunks=" + nChunks);
+                            android.util.Log.i(TAG, "[STREAM] UDP Send video frame=" + totalFrames + " chunk=" + nChunks + " total=" + finalFrameData.length + "B");
                     }
                     encoder.releaseOutputBuffer(outIndex, false);
                 } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     android.util.Log.i(TAG, "MediaCodec.INFO_OUTPUT_FORMAT_CHANGED");
+                    try {
+                        MediaFormat format = encoder.getOutputFormat();
+                        if (format != null && format.containsKey("csd-0") && format.containsKey("csd-1")) {
+                            ByteBuffer csd0 = format.getByteBuffer("csd-0");
+                            ByteBuffer csd1 = format.getByteBuffer("csd-1");
+                            if (csd0 != null && csd1 != null) {
+                                spsData = new byte[csd0.remaining()];
+                                csd0.get(spsData);
+                                ppsData = new byte[csd1.remaining()];
+                                csd1.get(ppsData);
+                                android.util.Log.i(TAG,"[SPS/PPS] Cập nhật lại SPS/PPS " + spsData.length + "/" + ppsData.length + " bytes.");
+                                android.util.Log.i(TAG, "[LOG-SPS] " + bytesToHex(spsData));
+                                android.util.Log.i(TAG, "[LOG-PPS] " + bytesToHex(ppsData));
+                            }
+                        }
+                    } catch (Exception ex) {
+                        android.util.Log.w(TAG,"[SPS/PPS] Không lấy được csd khi format changed: " + ex.getMessage());
+                    }
                 }
             }
             android.util.Log.i(TAG, "encodeLoop exited normally");
@@ -126,6 +181,28 @@ public class H264ScreenStreamer {
             if (udpSocket != null) udpSocket.close();
             android.util.Log.i(TAG, "encodeLoop finished, UDP socket closed");
         }
+    }
+
+    private String bytesToHex(byte[] data) {
+        if (data == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < data.length; i++) {
+            String hex = Integer.toHexString(data[i] & 0xFF);
+            if (hex.length() == 1) sb.append('0');
+            sb.append(hex);
+        }
+        return sb.toString();
+    }
+    private String bytesToHex(byte[] data, int limit) {
+        if (data == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(data.length, limit); i++) {
+            String hex = Integer.toHexString(data[i] & 0xFF);
+            if (hex.length() == 1) sb.append('0');
+            sb.append(hex);
+        }
+        if (limit < data.length) sb.append("...");
+        return sb.toString();
     }
 
     public void stop() {
@@ -141,7 +218,6 @@ public class H264ScreenStreamer {
         return inputSurface;
     }
 
-    // Xin MediaProjection (outside integration)
     public static MediaProjection requestMediaProjection(Activity activity, int resultCode, Intent data) {
         MediaProjectionManager mpm = (MediaProjectionManager) activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         return mpm.getMediaProjection(resultCode, data);

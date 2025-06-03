@@ -26,9 +26,12 @@ public class MainActivity extends AppCompatActivity {
     private DeviceAdapter adapter;
     private final List<DeviceItem> devices = new ArrayList<>();
     private Button scanButton;
+    private Button manualConnectButton; // Đổi thành field thay vì biến local trong onCreate!
+    private Button cancelConnectionButton; // Nút hủy kết nối động
     private boolean isScanning = false;
     // --- Thêm field giữ UdpScreenSender ---
     private UdpScreenSender udpScreenSender = null;
+    private boolean isStreaming = false;
 
     static {
         System.loadLibrary("talet_engine");
@@ -52,16 +55,28 @@ public class MainActivity extends AppCompatActivity {
         scanButton.setOnClickListener(v -> toggleScan());
 
         // ---------------------
-        // Thêm nút "Kết nối thủ công" (Manual connect)
-        Button manualConnectButton = new Button(this);
-        manualConnectButton.setText("Kết nối thủ công");
-        manualConnectButton.setBackgroundColor(0xff31e981);
-        manualConnectButton.setTextColor(0xff111111);
-        manualConnectButton.setAllCaps(false);
-        manualConnectButton.setTextSize(16f);
-        manualConnectButton.setPadding(16,12,16,12);
-        manualConnectButton.setOnClickListener(v -> showManualConnectDialog());
-        ((ViewGroup)findViewById(R.id.device_list).getParent()).addView(manualConnectButton);
+                // Thêm nút "Kết nối thủ công" (Manual connect) bằng trường field để điều khiển ẩn/hiện
+                manualConnectButton = new Button(this);
+                manualConnectButton.setText("Kết nối thủ công");
+                manualConnectButton.setBackgroundColor(0xff31e981);
+                manualConnectButton.setTextColor(0xff111111);
+                manualConnectButton.setAllCaps(false);
+                manualConnectButton.setTextSize(16f);
+                manualConnectButton.setPadding(16,12,16,12);
+                manualConnectButton.setOnClickListener(v -> showManualConnectDialog());
+                ((ViewGroup)findViewById(R.id.device_list).getParent()).addView(manualConnectButton);
+        
+                // Nút Hủy kết nối (ẩn mặc định, chỉ hiện khi đã streaming)
+                cancelConnectionButton = new Button(this);
+                cancelConnectionButton.setText("Hủy kết nối");
+                cancelConnectionButton.setBackgroundColor(0xffe83f5b);
+                cancelConnectionButton.setTextColor(0xffffffff);
+                cancelConnectionButton.setAllCaps(false);
+                cancelConnectionButton.setTextSize(16f);
+                cancelConnectionButton.setPadding(16,12,16,12);
+                cancelConnectionButton.setVisibility(View.GONE);
+                cancelConnectionButton.setOnClickListener(v -> cancelConnection());
+                ((ViewGroup)findViewById(R.id.device_list).getParent()).addView(cancelConnectionButton);
 
         // Cấu hình RecyclerView
         adapter = new DeviceAdapter(devices);
@@ -400,24 +415,57 @@ public class MainActivity extends AppCompatActivity {
 
     // Chuyển sang giao diện/màn hình streaming, tuỳ ý tuỳ chỉnh lại sau này
     private void goToStreamingScreen(DeviceItem device) {
-        // Khởi động gửi màn hình qua UDP tới Talet PC sau khi xác thực xong!
+        // Gọi luôn foreground service media projection TRỰC TIẾP từ MainActivity, không chuyển màn hình!
         try {
-            // Luôn ngắt instance cũ nếu có
-            if (udpScreenSender != null) {
-                udpScreenSender.stop();
-                udpScreenSender = null;
-            }
-            // Lấy đúng IP đối tượng (PC đã nhập), gửi qua cổng 27200 mặc định
-            udpScreenSender = new UdpScreenSender(this, device.getIp(), 27200);
-            udpScreenSender.start();
-            showToast("Bắt đầu gửi màn hình lên PC (" + device.getIp() + ":27200) qua UDP!");
+            android.util.Log.i("TALET", "[AUTO] MainActivity: Tự động gọi MediaProjection xin quyền foreground.");
+            android.media.projection.MediaProjectionManager mpm = (android.media.projection.MediaProjectionManager)
+                    getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE);
+            android.content.Intent permissionIntent = mpm.createScreenCaptureIntent();
+
+            // Gọi dialog xin quyền (trả về onActivityResult)
+            this.streamingTargetIp = device.getIp();
+            this.streamingTargetPort = 27200;
+            startActivityForResult(permissionIntent, 8001);
+
         } catch (Exception ex) {
-            showAlert("Gửi màn hình thất bại", ex.getMessage());
+            showAlert("Lỗi foreground stream", ex.getMessage());
         }
-        // UI update như cũ
-        statusText.setText("Đã kết nối tới " + device.getName() + "\n(Streaming to PC trên LAN)");
+        statusText.setText("Đã kết nối tới " + device.getName() + "\n(Streaming to PC trên LAN, foreground)");
         deviceList.setVisibility(View.GONE);
         progressBar.setVisibility(View.GONE);
+        scanButton.setVisibility(View.GONE);
+        manualConnectButton.setVisibility(View.GONE);
+        cancelConnectionButton.setVisibility(View.VISIBLE);
+        isStreaming = true;
+    }
+
+    // Thêm biến lưu server IP/port để truyền permission xuống service
+    private String streamingTargetIp = null;
+    private int streamingTargetPort = 27200;
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == 8001) {
+            android.util.Log.i("TALET", "[AUTO] MainActivity: Nhận permission MediaProjection foreground result: " + resultCode + ", intent=" + data);
+            if (resultCode == RESULT_OK && data != null && streamingTargetIp != null) {
+                // Gửi permission intent vào static cache
+                com.kr.talet.StreamIntentCache.set(data);
+                android.content.Intent serviceIntent = new android.content.Intent(this, H264StreamService.class);
+                serviceIntent.putExtra("server_ip", streamingTargetIp);
+                serviceIntent.putExtra("server_port", streamingTargetPort);
+                serviceIntent.putExtra("result_code", resultCode);
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent);
+                } else {
+                    startService(serviceIntent);
+                }
+                showToast("Đã bắt đầu foreground streaming trực tiếp!");
+            } else {
+                showAlert("Lỗi quyền", "Bạn cần cấp quyền ghi màn hình!");
+            }
+            streamingTargetIp = null;  // reset để tránh rò rỉ state
+        }
     }
 
     // Báo lỗi ghép nối
@@ -433,5 +481,23 @@ public class MainActivity extends AppCompatActivity {
 
     private void showToast(final String message) {
         runOnUiThread(() -> android.widget.Toast.makeText(MainActivity.this, message, android.widget.Toast.LENGTH_SHORT).show());
+    }
+
+    // Hàm hủy kết nối streaming (gọi bởi nút cancelConnectionButton)
+    private void cancelConnection() {
+        runOnUiThread(() -> {
+            // Stop streamer nếu có
+            stopDiscovery();
+            if (udpScreenSender != null) {
+                udpScreenSender.stop();
+                udpScreenSender = null;
+            }
+            // Hiện lại các nút scan/manual, ẩn cancel
+            scanButton.setVisibility(View.VISIBLE);
+            manualConnectButton.setVisibility(View.VISIBLE);
+            cancelConnectionButton.setVisibility(View.GONE);
+            statusText.setText("Đã ngắt kết nối!");
+            isStreaming = false;
+        });
     }
 }
